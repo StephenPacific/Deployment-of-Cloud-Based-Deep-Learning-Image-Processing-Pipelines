@@ -1,0 +1,20 @@
+
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16
+    container_name: project_postgres
+    environment:
+      POSTGRES_DB: your_project_db
+      POSTGRES_USER: dev_user
+      POSTGRES_PASSWORD: dev_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

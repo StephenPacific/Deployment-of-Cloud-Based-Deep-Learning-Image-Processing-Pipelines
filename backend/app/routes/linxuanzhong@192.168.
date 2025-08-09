@@ -1,0 +1,769 @@
+from flask import Blueprint, request, send_file, jsonify, current_app
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from marshmallow import Schema, fields, ValidationError
+from registration_stub import run_registration
+from werkzeug.utils import secure_filename
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from bson.objectid import ObjectId
+from dotenv import load_dotenv 
+from app import mongo
+import bcrypt
+import os
+import re
+import smtplib
+import random
+import glob
+import json
+import numpy as np
+import h5py
+import io
+from bson import ObjectId
+from urllib.parse import unquote
+from PIL import Image
+import shutil     
+import hashlib
+
+
+
+
+
+auth_bp = Blueprint('auth', __name__)
+
+
+# === Schemas ===
+
+class UserRegistrationSchema(Schema):
+    username = fields.Str(required=True, validate=lambda x: len(x) >= 3)
+    email = fields.Email(required=True)
+    password = fields.Str(required=True, validate=lambda x: len(x) >= 6)
+    confirm_password = fields.Str(required=True,data_key='password_confirm')
+    organization = fields.Str(required=False, allow_none=True, load_default="")
+
+
+class UserLoginSchema(Schema):
+    email = fields.Email(required=True)
+    password = fields.Str(required=True)
+    
+
+# === Helpers ===
+
+def serialize_user(user):
+    return {
+        "id": str(user["_id"]),
+        "username": user["username"],
+        "email": user["email"],
+        "is_active": user.get("is_active", True),
+        # "is_active": True,
+        # 管理员封号 is_active才是false；普通登出不修改is_active
+        "organization": user.get("organization", ""),
+        "avatarUrl": user.get("avatarUrl", ""),
+        "is_admin": user.get("is_admin", False)
+    }
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def check_password(password, hashed):
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+
+@auth_bp.route('/register', methods=['POST'])
+def register():
+    print("Request JSON:", request.json)
+
+    schema = UserRegistrationSchema()
+    try:
+        data = schema.load(request.json)
+    except ValidationError as err:
+        print("Validation Error:", err.messages)
+        return jsonify({'errors': err.messages}), 400
+
+    if not data['username'].strip():
+        return jsonify({'error': 'Username cannot be blank'}), 400
+    if not data['email'].strip():
+        return jsonify({'error': 'Email cannot be blank'}), 400
+    if not data['password'].strip():
+        return jsonify({'error': 'Password cannot be blank'}), 400
+    if '@' not in data['email'] or not data['email'].endswith('.com'):
+        return jsonify({'error': 'Email must be in the format name@domain.com'}), 400
+
+    if mongo.db.users.find_one({'email': data['email']}):
+        return jsonify({'error': 'Email already registered'}), 409
+    if mongo.db.users.find_one({'username': data['username']}):
+        return jsonify({'error': 'Username already taken'}), 409
+
+    user = {
+        "username": data["username"],
+        "email": data["email"],
+        "password": hash_password(data["password"]),
+        "is_active": True,
+        "organization": data.get("organization", ""),
+        "is_admin": False
+    }
+
+    result = mongo.db.users.insert_one(user)
+    user["_id"] = result.inserted_id
+
+    access_token = create_access_token(identity=str(user["_id"]))
+    return jsonify({
+        'message': 'User registered successfully',
+        'token': access_token,
+        'user': serialize_user(user)
+    }), 201
+
+
+@auth_bp.route('/login', methods=['POST'])
+def login():
+    schema = UserLoginSchema()
+    try:
+        data = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify({'errors': err.messages}), 400
+
+    email = data["email"].strip()
+    password = data["password"].strip()
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password cannot be blank'}), 400
+    if '@' not in email or not email.endswith('.com'):
+        return jsonify({'error': 'Invalid email format'}), 400
+
+    user = mongo.db.users.find_one({'email': email})
+    if not user or not check_password(password, user["password"]):
+        return jsonify({'error': 'Invalid email or password'}), 401
+    if not user.get("is_active", True):
+        return jsonify({'error': 'Account is deactivated'}), 403
+
+    access_token = create_access_token(identity=str(user["_id"]))
+    mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'is_active': True}})
+
+    return jsonify({
+        'message': 'Login successful',
+        'token': access_token,
+        'user': serialize_user(user),
+        'redirect_url': '/admin' if user.get("is_admin", False) else '/dashboard'
+    }), 200
+
+load_dotenv()  
+def generate_code():
+    return str(random.randint(100000, 999999))
+
+def send_email(to_email, code):
+    sender_email = os.getenv("EMAIL_USER")
+    sender_pass = os.getenv("EMAIL_PASS")
+
+    msg = MIMEText(f"Your password reset code is: {code}")
+    msg["Subject"] = "Password Reset Code"
+    msg["From"] = sender_email
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, sender_pass)
+            server.send_message(msg)
+        print(f" Email sent to {to_email}")
+    except Exception as e:
+        print(f" Failed to send email: {e}")
+
+@auth_bp.route('/send-reset-code', methods=['POST'])
+def send_reset_code():
+    data = request.json
+    email = data.get("email", "").strip()
+
+    if not email or '@' not in email or not email.endswith('.com'):
+        return jsonify({'error': 'Invalid email'}), 400
+
+    user = mongo.db.users.find_one({'email': email})
+    if not user:
+        return jsonify({'error': 'Email not registered'}), 404
+
+    code = generate_code()
+    expiry = datetime.utcnow() + timedelta(minutes=10)
+
+    mongo.db.users.update_one({'_id': user['_id']}, {
+        '$set': {
+            'reset_code': code,
+            'reset_code_expiry': expiry
+        }
+    })
+
+    send_email(email, code)
+    return jsonify({'message': 'Reset code sent to email'}), 200
+
+@auth_bp.route('/verify-reset-code', methods=['POST'])
+def verify_reset_code():
+    data = request.json
+    email = data.get("email", "").strip()
+    code = data.get("code", "").strip()
+    new_password = data.get("new_password", "").strip()
+    confirm_password = data.get("confirm_password", "").strip()
+
+    if not all([email, code, new_password, confirm_password]):
+        return jsonify({'error': 'All fields are required'}), 400
+    if new_password != confirm_password:
+        return jsonify({'error': 'Passwords do not match'}), 400
+    if len(new_password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+
+    user = mongo.db.users.find_one({'email': email})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    if user.get("reset_code") != code:
+        return jsonify({'error': 'Invalid reset code'}), 400
+
+    expiry = user.get("reset_code_expiry")
+    if not expiry or datetime.utcnow() > expiry:
+        return jsonify({'error': 'Reset code expired'}), 400
+
+    hashed_pw = hash_password(new_password)
+    mongo.db.users.update_one({'_id': user['_id']}, {
+        '$set': {'password': hashed_pw},
+        '$unset': {'reset_code': "", 'reset_code_expiry': ""}
+    })
+
+    return jsonify({'message': 'Password reset successfully'}), 200
+
+
+@auth_bp.route('/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    user_id = get_jwt_identity()
+    mongo.db.users.update_one({'_id': ObjectId(user_id)}, {'$set': {'is_active': True}}) #debug: False
+    return jsonify({'message': 'Logout successful'}), 200
+
+
+@auth_bp.route('/profile', methods=['GET'])
+@jwt_required()
+def get_profile():
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify(serialize_user(user)), 200
+
+@auth_bp.route('/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.json
+    update_fields = {}
+
+    if 'username' in data and data['username'].strip():
+        update_fields['username'] = data['username'].strip()
+
+    if 'email' in data and data['email'].strip():
+        new_email = data['email'].strip()
+        if '@' not in new_email or not new_email.endswith('.com'):
+            return jsonify({'error': 'Invalid email format'}), 400
+        existing = mongo.db.users.find_one({'email': new_email, '_id': {'$ne': ObjectId(user_id)}})
+        if existing:
+            return jsonify({'error': 'Email already in use'}), 409
+        update_fields['email'] = new_email
+        
+    if 'organization' in data:
+        update_fields['organization'] = data['organization'].strip() if data['organization'] else ""
+
+    if 'avatarUrl' in data:
+        update_fields['avatarUrl'] = data['avatarUrl'].strip() if data['avatarUrl'] else ""
+
+    if 'password' in data:
+        new_password = data['password'].strip()
+
+        if new_password:
+            if len(new_password) < 6:
+                return jsonify({'error': 'Password must be at least 6 characters'}), 400
+            update_fields['password'] = hash_password(new_password)
+            
+    if update_fields:
+        mongo.db.users.update_one({'_id': ObjectId(user_id)}, {'$set': update_fields})
+
+    updated_user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    return jsonify({'message': 'Profile updated', 'user': serialize_user(updated_user)}), 200
+
+
+@auth_bp.route('/dashboard', methods=['GET'])
+@jwt_required()
+def get_current_user():
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify(serialize_user(user)), 200
+
+# reset password
+@auth_bp.route('/reset-password', methods=['POST'])
+def reset_password():
+    data = request.json
+    email = data.get("email", "").strip()
+    new_password = data.get("new_password", "").strip()
+    confirm_password = data.get("confirm_password", "").strip()
+
+    if not email or not new_password or not confirm_password:
+        return jsonify({'error': 'All fields are required'}), 400
+
+    if '@' not in email or not email.endswith('.com'):
+        return jsonify({'error': 'Invalid email format'}), 400
+
+    user = mongo.db.users.find_one({'email': email})
+    if not user:
+        return jsonify({'error': 'Email not registered'}), 404
+
+    if len(new_password) < 6:
+        return jsonify({'error': 'New password must be at least 6 characters'}), 400
+
+    if new_password != confirm_password:
+        return jsonify({'error': 'Passwords do not match'}), 400
+
+   
+    hashed = hash_password(new_password)
+    mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'password': hashed}})
+
+    return jsonify({'message': 'Password reset successfully'}), 200
+
+
+
+# ================== upoad  ==================
+def _ensure(p): os.makedirs(p, exist_ok=True)
+def _has_tiff(f): return any(x.lower().endswith(('.tif','.tiff')) for x in os.listdir(f))
+
+# ================== 1. new-history ==================
+@auth_bp.route('/new-history', methods=['POST'])
+@jwt_required()
+def new_history():
+    uid  = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(uid)})
+    if not user:
+        return jsonify({'error':'user not found'}), 404
+
+    base = os.path.join(current_app.config['UPLOAD_ROOT'], user['username'])
+    _ensure(base)
+    nums = [int(d.split('_')[1]) for d in os.listdir(base)
+            if d.startswith('history_') and d.split('_')[1].isdigit()]
+    hid  = f'history_{max(nums,default=0)+1:03d}'
+    for sub in ('tmp_lr','tmp_hr','lr','hr'):
+        _ensure(os.path.join(base, hid, sub))
+    return jsonify({'history_id': hid}), 201
+
+# ================== 2. upload-chunk ==================
+@auth_bp.route('/upload-chunk', methods=['POST'])
+@jwt_required()
+def upload_chunk():
+    history_id = request.form.get('historyId')
+    file_id    = request.form.get('fileId')
+    file_name  = request.form.get('fileName')
+    folder_tp  = request.form.get('folderType')          # 'lr' | 'hr'
+    try:
+        idx = int(request.form.get('chunkIndex', -1))
+    except (TypeError, ValueError):
+        idx = -1
+    chunk   = request.files.get('chunk')
+    md5_end = request.form.get('md5')                    
+
+    # ---------- check ----------
+    print("DEBUG upload_chunk:",
+          history_id, file_id, file_name, folder_tp,
+          "chunk?", chunk is not None,
+          "idx=", request.form.get('chunkIndex'))
+
+    if not all([history_id, file_id, file_name, folder_tp, chunk]) or idx < 0:
+        return jsonify({'error': 'missing params'}), 400
+
+    uid   = get_jwt_identity()
+    uname = mongo.db.users.find_one({'_id': ObjectId(uid)})['username']
+    base  = os.path.join(current_app.config['UPLOAD_ROOT'], uname)
+    tmp_dir = os.path.join(base, history_id, f'tmp_{folder_tp}', file_id)
+    _ensure(tmp_dir)
+
+    chunk.save(os.path.join(tmp_dir, f'{idx:05d}.part'))
+
+    if md5_end:
+        with open(os.path.join(tmp_dir, '_md5.txt'), 'w') as f:
+            f.write(md5_end)
+
+    with open(os.path.join(tmp_dir, '_history.txt'), 'w') as f:
+        f.write(history_id)
+
+    return jsonify({'message': f'chunk {idx} ok'}), 200
+
+
+# ================== 3. merge-chunks ==================
+@auth_bp.route('/merge-chunks', methods=['POST'])
+@jwt_required()
+def merge_chunks():
+    data = request.get_json(force=True) or {}
+    history_id = data.get('historyId')
+    file_id    = data.get('fileId')
+    file_name  = data.get('fileName')
+    folder_tp  = data.get('folderType')
+    md5_front  = data.get('md5')
+    if not all([history_id,file_id,file_name,folder_tp,md5_front]):
+        return jsonify({'error':'missing params'}), 400
+
+    uid  = get_jwt_identity()
+    base_user = mongo.db.users.find_one({'_id':ObjectId(uid)})['username']
+    base = os.path.join(current_app.config['UPLOAD_ROOT'], base_user)
+    tmp_dir = os.path.join(base, history_id, f'tmp_{folder_tp}', file_id)
+    if not os.path.isdir(tmp_dir):
+        return jsonify({'error':'tmp dir not found'}), 400
+    with open(os.path.join(tmp_dir,'_md5.txt')) as f: md5_saved = f.read().strip()
+
+    dest_dir = os.path.join(base, history_id, folder_tp)
+    _ensure(dest_dir)
+    dest_path = os.path.join(dest_dir, file_name)
+    with open(dest_path,'wb') as out_f:
+        for p in sorted(glob.glob(os.path.join(tmp_dir,'*.part'))):
+            with open(p,'rb') as in_f: shutil.copyfileobj(in_f,out_f,8*1024*1024)
+    h = hashlib.md5()
+    with open(dest_path, 'rb') as fp:
+        for blk in iter(lambda: fp.read(8*1024*1024), b''):
+            h.update(blk)
+    md5_calc = h.hexdigest()
+
+    if md5_calc!=md5_saved or md5_saved!=md5_front:
+        os.remove(dest_path); return jsonify({'error':'md5 mismatch'}),400
+
+    shutil.rmtree(tmp_dir,ignore_errors=True)
+    parent_tmp = os.path.dirname(tmp_dir)
+    if not os.listdir(parent_tmp): shutil.rmtree(parent_tmp,ignore_errors=True)
+
+    lr_dir = os.path.join(base, history_id,'lr')
+    hr_dir = os.path.join(base, history_id,'hr')
+    tmp_left = any(d.startswith('tmp_') for d in os.listdir(os.path.join(base,history_id)))
+    if _has_tiff(lr_dir) and _has_tiff(hr_dir) and not tmp_left:
+        meta = {
+          'history_id':history_id,
+          'createtime':datetime.now().strftime('%Y-%m-%d %H:%M'),
+          'preprocess-status':'unpreprocessed',
+          'train-status':'untrained'
+        }
+        with open(os.path.join(base,history_id,'metadata.json'),'w') as f: json.dump(meta,f)
+
+    return jsonify({'message':f'{file_name} merged','history_id':history_id}),200
+
+
+
+def has_tiff_images(folder):
+    return any(f.lower().endswith('.tif') for f in os.listdir(folder))
+
+
+
+
+def has_tiff_images(folder):
+    return any(fname.lower().endswith(('.tif', '.tiff')) for fname in os.listdir(folder))
+
+
+
+@auth_bp.route('/run_preprocess', methods=['POST'])
+@jwt_required()
+def run_preprocess():
+    UPLOAD_ROOT = current_app.config['UPLOAD_ROOT']
+    
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    username = user['username']
+    base_dir   = os.path.join(UPLOAD_ROOT, username)
+
+    data = request.get_json()
+    history_id = data.get('history_id')
+    if not history_id or not re.match(r'^history_\d+$', history_id):
+        return jsonify({'error': 'Missing or invalid history_id'}), 400
+
+    history_dir = os.path.join(base_dir, history_id)
+    if not os.path.exists(history_dir):
+        return jsonify({'error': 'History directory not found'}), 400
+
+    lr_dir = os.path.join(history_dir, 'lr')
+    hr_dir = os.path.join(history_dir, 'hr')
+    lr_pre = os.path.join(history_dir, 'lr_preprocessed')
+    hr_pre = os.path.join(history_dir, 'hr_preprocessed')
+    os.makedirs(lr_pre, exist_ok=True)
+    os.makedirs(hr_pre, exist_ok=True)
+
+    metadata_lr = os.path.join(lr_dir, "scan_settings.txt")
+    metadata_hr = os.path.join(hr_dir, "scan_settings.txt")
+
+    if not has_tiff_images(lr_dir) or not has_tiff_images(hr_dir):
+        return jsonify({'error': 'Missing .tif images in lr/ or hr/'}), 400
+
+    if not os.path.exists(metadata_lr) or not os.path.exists(metadata_hr):
+        return jsonify({'error': 'Missing scan_settings.txt'}), 400
+
+    try:
+        result = run_registration(
+            slices_path_full=lr_dir,
+            slices_path_roi=hr_dir,
+            metadata_path_full=metadata_lr,
+            metadata_path_roi=metadata_hr,
+            output_cube_roi_dir=hr_pre,
+            output_cube_full_dir=lr_pre
+        )
+
+        meta_path = os.path.join(history_dir, "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            meta['preprocess-status'] = 'preprocessed'
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f)
+
+        return jsonify({
+            'message': 'Preprocessing completed successfully',
+            'log': result,
+            'history': history_id
+        }), 200
+
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+@auth_bp.route('/upload-preview', methods=['GET'])  
+@jwt_required()
+def upload_preview():
+    UPLOAD_ROOT = current_app.config['UPLOAD_ROOT']
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    username = user['username']
+    user_base_dir = os.path.join(UPLOAD_ROOT, username)
+
+    history_id = request.args.get('history_id')
+    if not history_id or not re.match(r'^history_\d+$', history_id):
+        return jsonify({'error': 'Missing or invalid history_id'}), 400
+
+    lr_dir = os.path.join(user_base_dir, history_id, 'lr')
+    hr_dir = os.path.join(user_base_dir, history_id, 'hr')
+
+    def is_tiff(filename):
+        return filename.lower().endswith('.tif') or filename.lower().endswith('.tiff')
+
+    lr_files = sorted([
+        f for f in os.listdir(lr_dir)
+        if os.path.isfile(os.path.join(lr_dir, f)) and is_tiff(f)
+    ]) if os.path.exists(lr_dir) else []
+
+    hr_files = sorted([
+        f for f in os.listdir(hr_dir)
+        if os.path.isfile(os.path.join(hr_dir, f)) and is_tiff(f)
+    ]) if os.path.exists(hr_dir) else []
+
+    lr_urls = [f'/static/uploads/{username}/{history_id}/lr/{fname}' for fname in lr_files]
+    hr_urls = [f'/static/uploads/{username}/{history_id}/hr/{fname}' for fname in hr_files]
+
+    return jsonify({
+        'lr_images': lr_urls,
+        'hr_images': hr_urls,
+        'history': history_id
+    }), 200
+
+
+@auth_bp.route('/history', methods=['GET'])
+@jwt_required()
+def get_training_history():
+    UPLOAD_ROOT = current_app.config['UPLOAD_ROOT']
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    username = user['username']
+    user_dir    = os.path.join(UPLOAD_ROOT, username)
+
+    if not os.path.exists(user_dir):
+        return jsonify([]), 200
+
+    history_list = []
+
+    for entry in sorted(os.listdir(user_dir)):
+        if not re.match(r'^history_\d+$', entry):
+            continue
+
+        metadata_path = os.path.join(user_dir, entry, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            continue
+
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        history_list.append({
+            "history_id": metadata.get("history_id", entry),  
+            "createtime": metadata.get("createtime", ""),
+            "train_status": metadata.get("train-status", ""),
+            "preprocess_status": metadata.get("preprocess-status", "")
+        })
+
+    return jsonify(history_list), 200
+
+
+@auth_bp.route('/route-target/<history_id>', methods=['GET'])
+@jwt_required()
+def get_route_for_history(history_id):
+    UPLOAD_ROOT = current_app.config['UPLOAD_ROOT']
+    user_id = get_jwt_identity()
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    username = user['username']
+    history_dir = os.path.join(UPLOAD_ROOT, username, history_id)
+
+    if not os.path.exists(history_dir):
+        return jsonify({'error': 'History directory not found'}), 404
+
+    metadata_path = os.path.join(history_dir, 'metadata.json')
+    if not os.path.exists(metadata_path):
+        return jsonify({'error': 'Metadata not found'}), 404
+
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+
+    preprocess_status = metadata.get('preprocess-status', '')
+    train_status = metadata.get('train-status', '')
+
+    if preprocess_status == 'unpreprocessed':
+        return jsonify({'route': 'preview'}), 200
+
+    if preprocess_status == 'preprocessed' and train_status == 'untrained':
+        return jsonify({'route': 'train'}), 200
+
+    return jsonify({'error': 'This model is already trained or invalid for use'}), 400
+
+
+
+
+@auth_bp.route('/preprocess-preview', methods=['GET'])
+@jwt_required()
+def preprocess_preview():
+    UPLOAD_ROOT = current_app.config['UPLOAD_ROOT']  # e.g., 'user_data/db'
+    user_id = get_jwt_identity()
+
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    username = user['username']
+    history_id = request.args.get('history_id')
+
+    if not history_id or not re.match(r'^history_\d+$', history_id):
+        return jsonify({'error': 'Missing or invalid history_id'}), 400
+
+    base_path = os.path.join(UPLOAD_ROOT, username, history_id)
+    lr_path = os.path.join(base_path, 'lr_preprocessed', 'cropped_volume_FULL.h5')
+    hr_path = os.path.join(base_path, 'hr_preprocessed', 'cropped_volume_ROI.h5')
+
+    return jsonify({
+        'lr_h5': lr_path,  
+        'hr_h5': hr_path,
+        'history': history_id
+    }), 200
+
+
+
+
+
+
+
+@auth_bp.route('/h5-slice', methods=['GET'])
+@jwt_required()
+def h5_slice():
+    axis = request.args.get('axis', 'z').lower()
+    try:
+        index = int(request.args.get('index', '0'))
+    except ValueError:
+        return jsonify({'error': 'Invalid index'}), 400
+
+    h5_path = request.args.get('h5_path', '').strip()
+    history_id = request.args.get('history_id', '').strip()
+    user_id = get_jwt_identity()
+
+    if not h5_path or not history_id:
+        return jsonify({'error': 'Missing h5_path or history_id'}), 400
+    if axis not in ('x', 'y', 'z'):
+        return jsonify({'error': 'Invalid axis'}), 400
+    if not re.match(r'^history_\d+$', history_id):
+        return jsonify({'error': 'Invalid history_id'}), 400
+
+    user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    username = user['username']
+
+    h5_path = unquote(h5_path)
+
+    if os.path.isabs(h5_path):
+        h5_abs_path = h5_path
+    elif h5_path.startswith('/static/'):
+        rel_path = h5_path.replace('/static/', '/user-data/db', 1)
+        h5_abs_path = os.path.join(current_app.static_folder, rel_path)
+    else:
+        h5_abs_path = os.path.join(os.getcwd(), h5_path.lstrip('/'))
+
+    if not os.path.exists(h5_abs_path):
+        return jsonify({'error': f'H5 file not found: {h5_abs_path}'}), 404
+
+
+
+    if not os.path.exists(h5_abs_path):
+        return jsonify({'error': f'H5 file not found: {h5_abs_path}'}), 404
+
+    try:
+        with h5py.File(h5_abs_path, 'r') as f:
+            vol = f['data'][:]
+            if axis == 'x':
+                if index >= vol.shape[0]:
+                    return jsonify({'error': 'Index out of range'}), 400
+                slice_data = vol[index, :, :]
+            elif axis == 'y':
+                if index >= vol.shape[1]:
+                    return jsonify({'error': 'Index out of range'}), 400
+                slice_data = vol[:, index, :]
+            else:  # 'z'
+                if index >= vol.shape[2]:
+                    return jsonify({'error': 'Index out of range'}), 400
+                slice_data = vol[:, :, index]
+
+            norm = (slice_data - np.min(slice_data)) / (np.ptp(slice_data) + 1e-8)
+            image_uint8 = (norm * 255).astype(np.uint8)
+            img = Image.fromarray(image_uint8)
+
+            buffer = io.BytesIO()
+            img.save(buffer, format='PNG')
+            buffer.seek(0)
+            return send_file(buffer, mimetype='image/png')
+
+    except Exception as e:
+        return jsonify({'error': f'Failed to load H5 file: {str(e)}'}), 500
+
+
+@auth_bp.route('/h5-meta', methods=['GET'])
+@jwt_required()
+def h5_meta():
+    
+    h5_path = request.args.get('h5_path', '').strip()
+    history_id = request.args.get('history_id', '').strip()
+
+    if not h5_path or not history_id:
+        return jsonify({'error': 'Missing h5_path or history_id'}), 400
+
+    if not os.path.exists(h5_path):
+        return jsonify({'error': f'File not found: {h5_path}'}), 404
+
+    try:
+        with h5py.File(h5_path, 'r') as f:
+            shape = list(f['data'].shape)
+        return jsonify({'shape': shape}), 200
+    except Exception as e:
+        return jsonify({'error': f'Failed to read h5: {str(e)}'}), 500

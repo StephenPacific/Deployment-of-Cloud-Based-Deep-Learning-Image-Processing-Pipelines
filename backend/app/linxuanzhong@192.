@@ -1,0 +1,117 @@
+
+from flask import Flask
+from flask_pymongo import PyMongo
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager
+from config import config
+
+from flask import send_from_directory
+import os
+
+
+cors = CORS()
+jwt = JWTManager()
+mongo = PyMongo()  
+
+# def create_app(config_name='development'):
+#     app = Flask(__name__)
+#     app.config.from_object(config[config_name])
+
+#     app.config["MONGO_URI"] = (
+#         "mongodb+srv://Cluster06853:TkJ4Y2V5VnVk@cluster06853.uyyxvvf.mongodb.net/9900?retryWrites=true&w=majority&appName=Cluster06853"
+#     )
+#     import certifi
+#     app.config["MONGO_TLS_CA_FILE"] = certifi.where()
+
+    
+#     CORS(app,
+#         resources={r"/*": {"origins": ["http://localhost:5173"]}},  
+#         supports_credentials=True,
+#         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+#         allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
+#     )
+
+#     jwt.init_app(app)
+#     mongo.init_app(app)
+
+#     print("MongoDB connected:", mongo.db is not None)
+
+
+    
+#     from app.routes import register_blueprints
+#     register_blueprints(app)
+
+
+#     BASE_UPLOAD_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../db'))
+#     print("BASE_UPLOAD_PATH:", BASE_UPLOAD_PATH)
+
+
+#     @app.route('/static/uploads/<username>/<folder>/<filename>')
+#     def uploaded_file(username, folder, filename):
+#         directory = os.path.join(BASE_UPLOAD_PATH, username, folder)
+#         return send_from_directory(directory, filename)
+    
+#     # from app.routes.api import api_bp  # 导入你写的 Blueprint
+#     # app.register_blueprint(api_bp)  # 注册蓝图
+
+#     @app.route('/health')
+#     def health_check():
+#         return {'status': 'healthy', 'database': 'connected'}, 200
+
+#     return app
+
+def create_app(config_name='development'):
+    FRONTEND_DIST = '/home/ying/github-classroom/unsw-cse-comp99-3900/capstone-project-9900-f10a-cake/Project_v1.0/dist'
+    print('>>> FRONTEND_DIST =>', FRONTEND_DIST)   
+
+    app = Flask(
+        __name__,
+        static_folder=FRONTEND_DIST,   
+        static_url_path=''                  
+    )
+    app.config.from_object(config[config_name])
+
+    app.config["MONGO_URI"] = (
+        "mongodb+srv://Cluster06853:TkJ4Y2V5VnVk@cluster06853.uyyxvvf.mongodb.net/9900?retryWrites=true&w=majority&appName=Cluster06853"
+    )
+
+    CORS(app,
+        resources={r"/*": {"origins": ["http://localhost:5173"]}},  
+        supports_credentials=True,
+        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
+    )
+
+    jwt.init_app(app)
+    mongo.init_app(app)
+
+    print("MongoDB connected:", mongo.db is not None)
+
+    from app.routes import register_blueprints
+    register_blueprints(app)
+
+    BASE_UPLOAD_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../db'))
+    print("BASE_UPLOAD_PATH:", BASE_UPLOAD_PATH)
+
+    @app.route('/static/uploads/<username>/<folder>/<filename>')
+    def uploaded_file(username, folder, filename):
+        directory = os.path.join(BASE_UPLOAD_PATH, username, folder)
+        return send_from_directory(directory, filename)
+
+    @app.route('/health')
+    def health_check():
+        return {'status': 'healthy', 'database': 'connected'}, 200
+
+    @app.route('/', defaults={'path': ''})   # 根路径也走这里
+    @app.route('/<path:path>')
+    def serve_vue(path):
+        target = os.path.join(app.static_folder, path)
+
+        # 只有当 path 非空且文件真实存在时，才直接返回该文件
+        if path != '' and os.path.exists(target):
+            return send_from_directory(app.static_folder, path)
+
+        # 其它情况（包括 /、/dashboard 等前端路由）统一返回 index.html
+        return send_from_directory(app.static_folder, 'index.html')
+
+    return app

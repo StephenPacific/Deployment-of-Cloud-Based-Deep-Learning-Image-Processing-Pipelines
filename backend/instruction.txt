@@ -1,0 +1,10 @@
+启动项目：
+cd ~/venv/flask  # 或你 flask 项目的路径
+. .venv/bin/activate
+
+执行flask主程序：
+flask --app hello run # for hello.py
+flask --app app run # for app.py
+
+Application Discovery Behavior
+As a shortcut, if the file is named app.py or wsgi.py, you don’t have to use --app. See Command Line Interface for more details.
