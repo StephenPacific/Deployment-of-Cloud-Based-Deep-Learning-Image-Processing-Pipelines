@@ -1,4 +1,4 @@
-# Deployment of Cloud-Based Deep Learning Image Processing Pipelines for the Tyree Micro-CT Facility
+# Cloud-Based Deep Learning Image Processing
 
 ## Overview
 
